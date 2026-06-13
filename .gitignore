@@ -1,0 +1,10 @@
+# image files
+*.jpg
+*.jpeg
+*.png
+
+# json files
+*.json
+
+# model checkpoints
+models/*.pth
