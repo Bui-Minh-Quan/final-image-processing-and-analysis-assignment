@@ -29,44 +29,68 @@ def download_weights(url, save_path):
 
 
 # Model definition
+class DecoupledHead(nn.Module):
+    def __init__(self, in_channels=512, hidden_channels=256, B=2, C=5):
+        super(DecoupledHead, self).__init__()
+        
+        # 1. Stem 
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.LeakyReLU(0.1)
+        )
+
+        # 2. Localization branch
+        self.reg_branch = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(hidden_channels, B * 5, kernel_size=1)
+        )
+
+        # 3. Classification branch
+        self.cls_branch = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(hidden_channels, C, kernel_size=1)
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        
+    
+        reg_out = self.reg_branch(x) 
+        cls_out = self.cls_branch(x) 
+
+        out = torch.cat([reg_out, cls_out], dim=1) 
+
+        return torch.sigmoid(out)
+
 class YOLOv1ResNet(nn.Module):
-    def __init__(self, S=7, B=2, C=5):
+    def __init__(self, S=14, B=2, C=5):
         super(YOLOv1ResNet, self).__init__()
         self.S = S 
         self.B = B 
         self.C = C 
 
-        # 1. Backbone 
+        # 1. Backbone (ResNet18)
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])
 
-        # 2. YOLO head 
-        self.yolo_head = nn.Sequential(
-            nn.Conv2d(512,1024,3,padding=1),
-            nn.BatchNorm2d(1024),
-            nn.LeakyReLU(0.1),
+        # 2. Decoupled Head
+        self.yolo_head = DecoupledHead(in_channels=512, hidden_channels=256, B=self.B, C=self.C)
 
-            nn.Conv2d(1024,1024,3,padding=1),
-            nn.BatchNorm2d(1024),
-            nn.LeakyReLU(0.1),
-
-            nn.Conv2d(1024,512,3,padding=1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.1),
-
-            nn.Conv2d(512,15,1),
-            nn.Sigmoid()
-        )
-
-    
     def forward(self, x):
-        # Input: (Batch, 3, 448, 448)
-        x = self.backbone(x) # -> (Batch, 512, 14, 14)
-        x = self.yolo_head(x) # -> (Batch, 15, 14, 14)
-
-        x = x.permute(0, 2, 3, 1) # -> (Batch, 14, 14, 15)
-
+        x = self.backbone(x)
+        x = self.yolo_head(x)
+        x = x.permute(0, 2, 3, 1) 
         return x
 
 
@@ -93,104 +117,70 @@ def non_max_suppression(bboxes, iou_threshold=0.4, conf_threshold=0.05):
     return bboxes_after_nms
 
 
-def compute_diou_1d(box1, box2):
-    """
-    Tính toán Distance-IoU giữa 2 bounding box dạng [xmin, ymin, xmax, ymax]
-    """
-    # 1. Tính IoU truyền thống
-    x1, y1 = max(box1[0], box2[0]), max(box1[1], box2[1])
-    x2, y2 = min(box1[2], box2[2]), min(box1[3], box2[3])
-    
-    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
-    
-    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    
-    union_area = box1_area + box2_area - inter_area + 1e-6
-    iou = inter_area / union_area
-    
-    # 2. Tính bình phương khoảng cách giữa 2 tâm (d^2)
-    center1_x = (box1[0] + box1[2]) / 2.0
-    center1_y = (box1[1] + box1[3]) / 2.0
-    center2_x = (box2[0] + box2[2]) / 2.0
-    center2_y = (box2[1] + box2[3]) / 2.0
-    
-    d_sq = (center2_x - center1_x)**2 + (center2_y - center1_y)**2
-    
-    # 3. Tính bình phương đường chéo của hộp bao lớn nhất chứa cả 2 box (c^2)
-    c_x1 = min(box1[0], box2[0])
-    c_y1 = min(box1[1], box2[1])
-    c_x2 = max(box1[2], box2[2])
-    c_y2 = max(box1[3], box2[3])
-    
-    c_sq = (c_x2 - c_x1)**2 + (c_y2 - c_y1)**2 + 1e-6
-    
-    # 4. Công thức DIoU
-    diou = iou - (d_sq / c_sq)
-    return diou
-
-def diou_nms(bboxes, diou_threshold=0.4, conf_threshold=0.05):
-    """
-    Thuật toán Khử trùng lặp DIoU-NMS.
-    """
-    # Lọc thô ban đầu bằng điểm tự tin
-    bboxes = [box for box in bboxes if box[4] > conf_threshold]
-    
-    # Sắp xếp giảm dần theo confidence
-    bboxes = sorted(bboxes, key=lambda x: x[4], reverse=True)
-    
-    bboxes_after_nms = []
-    
-    while bboxes:
-        # Lấy hộp tốt nhất hiện tại ra khỏi danh sách
-        chosen_box = bboxes.pop(0)
-        bboxes_after_nms.append(chosen_box)
-        
-        # So sánh hộp vừa lấy với các hộp còn lại
-        # Giữ lại các hộp KHÁC LỚP, hoặc CÙNG LỚP nhưng có DIoU < ngưỡng
-        bboxes = [
-            box for box in bboxes 
-            if box[5] != chosen_box[5] or compute_diou_1d(chosen_box[:4], box[:4]) < diou_threshold
-        ]
-        
-    return bboxes_after_nms
-
-
 def soft_nms(bboxes, iou_threshold=0.4, conf_threshold=0.05, sigma=0.5):
     """
     Thuật toán Soft-NMS sử dụng hàm Gaussian penalty.
     """
-    # 1. Lọc thô ban đầu
     bboxes = [box for box in bboxes if box[4] > conf_threshold]
     bboxes_after_nms = []
 
     while len(bboxes) > 0:
-        # 2. Tìm hộp có confidence cao nhất hiện tại
         max_idx = max(range(len(bboxes)), key=lambda i: bboxes[i][4])
         chosen_box = bboxes.pop(max_idx)
         bboxes_after_nms.append(chosen_box)
 
-        # 3. Phạt (Decay) điểm confidence của các hộp còn lại thay vì xóa
         for box in bboxes:
-            # Nếu khác class thì bỏ qua
             if box[5] != chosen_box[5]:
                 continue
                 
             iou = compute_iou_1d(chosen_box[:4], box[:4])
-            
-            # Áp dụng hàm suy giảm Gaussian (Gaussian penalty)
-            # Nếu IoU càng lớn, điểm phạt càng nặng
+
             weight = math.exp(-(iou * iou) / sigma)
             
-            # Giảm điểm confidence
             box[4] = box[4] * weight
 
-        # 4. Lọc lại một lần nữa, những hộp bị phạt tụt xuống dưới ngưỡng thì bỏ
         bboxes = [box for box in bboxes if box[4] > conf_threshold]
 
     return bboxes_after_nms
 
-def decode_yolo_predictions(predictions, S=14, B=2, C=5, image_size=448, conf_threshold=0.05):
+
+def predict_with_tta(model, image, device, args):
+    orig_h, orig_w = image.shape[:2]
+    
+    img_resized = cv2.resize(image, (448, 448))
+    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+    
+    tensor_orig = torch.from_numpy(img_rgb).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+    tensor_orig = tensor_orig.to(device)
+
+    img_flipped = cv2.flip(img_rgb, 1)
+    tensor_flip = torch.from_numpy(img_flipped).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+    tensor_flip = tensor_flip.to(device)
+
+
+
+    with torch.no_grad():
+        out_orig = model(tensor_orig)[0].cpu()
+        out_flip = model(tensor_flip)[0].cpu()
+
+    boxes_orig = decode_yolo_predictions(out_orig, S=14, B=2, C=5, image_size=448, conf_thresh=args.conf_thresh)
+    boxes_flip = decode_yolo_predictions(out_flip, S=14, B=2, C=5, image_size=448, conf_thresh=args.conf_thresh)
+
+    for box in boxes_flip:
+        old_xmin = box[0]
+        old_xmax = box[2]
+        
+        box[0] = 448 - old_xmax
+        box[2] = 448 - old_xmin
+
+
+    combined_boxes = boxes_orig + boxes_flip
+    
+    final_boxes = soft_nms(combined_boxes, iou_threshold=args.iou_thresh, conf_threshold=args.conf_thresh)
+
+    return final_boxes
+
+def decode_yolo_predictions(predictions, S=14, B=2, C=5, image_size=448, conf_thresh=0.05):
     bboxes = []
     cell_size = image_size / S
     for i in range(S):
@@ -201,7 +191,7 @@ def decode_yolo_predictions(predictions, S=14, B=2, C=5, image_size=448, conf_th
             for b in range(B):
                 box_idx = b * 5
                 confidence = predictions[i, j, box_idx + 4].item() * class_score
-                if confidence < conf_threshold: continue
+                if confidence < conf_thresh: continue
                 x_cell = predictions[i, j, box_idx + 0].item()
                 y_cell = predictions[i, j, box_idx + 1].item()
                 w_norm = predictions[i, j, box_idx + 2].item()
@@ -226,7 +216,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Inference script for YOLOv1ResNet model")
     parser.add_argument('--image_dir', type=str, required=True, help='Path to the directory containing input images')
     parser.add_argument('--output', type=str, required=True, help='Path to the output file for predictions.json')
-    parser.add_argument('--conf_thresh', type=float, default=0.05, help='Confidence threshold (default: 0.05)')
+    parser.add_argument('--conf_thresh', type=float, default=0.2, help='Confidence threshold (default: 0.2)')
     parser.add_argument('--iou_thresh', type=float, default=0.4, help='NMS IoU threshold (default: 0.4)')
     return parser.parse_args()
 
@@ -256,27 +246,15 @@ def main():
 
     for filename in image_files:
         image_path  = os.path.join(args.image_dir, filename)
-        image =cv2.imread(image_path)
+        image = cv2.imread(image_path)
         if image is None:
             print(f"Warning: Could not read image {filename}. Skipping.")
             continue
 
         orig_h, orig_w = image.shape[:2]
-        image_resized = cv2.resize(image, (448, 448))
-        image_rgb = cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB)
-        image_tensor = torch.from_numpy(image_rgb).float().permute(2, 0, 1).unsqueeze(0) / 255.0
-        image_tensor = image_tensor.to(device)
 
-        # Forward pass
-        with torch.no_grad():
-            output = model(image_tensor)
-            pred_tensor = output[0].cpu()
+        bboxes_nms = predict_with_tta(model, image, device, args)
 
-        # Decode predictions
-        bboxes = decode_yolo_predictions(pred_tensor, S=14, B=2, C=5, image_size=448, conf_threshold=args.conf_thresh)
-        bboxes_nms = diou_nms(bboxes, diou_threshold=args.iou_thresh, conf_threshold=args.conf_thresh)
-
-        # Scale boxes back to original image size
         formatted_boxes = []
         scale_x = orig_w / 448.0
         scale_y = orig_h / 448.0
@@ -299,7 +277,7 @@ def main():
             "image_id": filename,
             "boxes": formatted_boxes
         })
-
+    
     # 4. Save results to JSON
     with open(args.output, 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)

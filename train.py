@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.models as models
+import math
 
 class YOLOAugmentation:
     def __init__(self, output_size=448):
@@ -26,8 +27,8 @@ class YOLOAugmentation:
     def random_photometric(self, image):
         if random.random() < 0.5:
             # Random Brightness & Contrast
-            alpha = random.uniform(0.7, 1.3) # Contrast (1.0 là gốc)
-            beta = random.uniform(-30, 30)   # Brightness (0 là gốc)
+            alpha = random.uniform(0.7, 1.3) # Contrast
+            beta = random.uniform(-30, 30)   # Brightness
             image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
         
         if random.random() < 0.5:
@@ -214,7 +215,7 @@ class YOLODataset(Dataset):
             x_cell = self.S * x_center - j
             y_cell = self.S * y_center - i
 
-            # Ignore if the cell is already assigned to another box (for simplicity, we only assign one box per cell)
+            # Ignore if the cell is already assigned to another box 
             if target_tensor[i, j, 4].item() != 0:
                 continue
 
@@ -229,44 +230,69 @@ class YOLODataset(Dataset):
         return image_tensor, target_tensor
     
 
+# Model definition
+class DecoupledHead(nn.Module):
+    def __init__(self, in_channels=512, hidden_channels=256, B=2, C=5):
+        super(DecoupledHead, self).__init__()
+        
+        # 1. Stem 
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.LeakyReLU(0.1)
+        )
+
+        # 2. Localization branch
+        self.reg_branch = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(hidden_channels, B * 5, kernel_size=1)
+        )
+
+        # 3. Classification branch
+        self.cls_branch = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(hidden_channels, C, kernel_size=1)
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        
+    
+        reg_out = self.reg_branch(x) 
+        cls_out = self.cls_branch(x) 
+
+        out = torch.cat([reg_out, cls_out], dim=1) 
+
+        return torch.sigmoid(out)
+
 class YOLOv1ResNet(nn.Module):
-    def __init__(self, S=7, B=2, C=5):
+    def __init__(self, S=14, B=2, C=5):
         super(YOLOv1ResNet, self).__init__()
         self.S = S 
         self.B = B 
         self.C = C 
 
-        # 1. Backbone 
+        # 1. Backbone (ResNet18)
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])
 
-        # 2. YOLO head 
-        self.yolo_head = nn.Sequential(
-            nn.Conv2d(512,1024,3,padding=1),
-            nn.BatchNorm2d(1024),
-            nn.LeakyReLU(0.1),
+        # 2. Decoupled Head
+        self.yolo_head = DecoupledHead(in_channels=512, hidden_channels=256, B=self.B, C=self.C)
 
-            nn.Conv2d(1024,1024,3,padding=1),
-            nn.BatchNorm2d(1024),
-            nn.LeakyReLU(0.1),
-
-            nn.Conv2d(1024,512,3,padding=1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.1),
-
-            nn.Conv2d(512,15,1),
-            nn.Sigmoid()
-        )
-
-    
     def forward(self, x):
-        # Input: (Batch, 3, 448, 448)
-        x = self.backbone(x) # -> (Batch, 512, 14, 14)
-        x = self.yolo_head(x) # -> (Batch, 15, 14, 14)
-
-        x = x.permute(0, 2, 3, 1) # -> (Batch, 14, 14, 15)
-
+        x = self.backbone(x)
+        x = self.yolo_head(x)
+        x = x.permute(0, 2, 3, 1) 
         return x
 
 
@@ -297,8 +323,8 @@ class YOLOLoss(nn.Module):
         
         return torch.stack([x_global, y_global, w, h], dim=-1)
 
-    def compute_giou(self, box1, box2):
-        """Compute GIoU (Generalized IoU) and IoU on global image coordinates [0, 1]"""
+    def compute_ciou(self, box1, box2):
+        """Compute CIoU (Complete IoU) and IoU on global image coordinates [0, 1]"""
         b1_x1 = box1[..., 0] - box1[..., 2] / 2
         b1_y1 = box1[..., 1] - box1[..., 3] / 2
         b1_x2 = box1[..., 0] + box1[..., 2] / 2
@@ -309,29 +335,43 @@ class YOLOLoss(nn.Module):
         b2_x2 = box2[..., 0] + box2[..., 2] / 2
         b2_y2 = box2[..., 1] + box2[..., 3] / 2
 
-        # 1. Calculate Intersection
+        # 1. Calculate Intersection (IoU)
         inter_x1 = torch.max(b1_x1, b2_x1)
         inter_y1 = torch.max(b1_y1, b2_y1)
         inter_x2 = torch.min(b1_x2, b2_x2)
         inter_y2 = torch.min(b1_y2, b2_y2)
         inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
 
-        # 2. Calculate Union
         b1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
         b2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
         union_area = b1_area + b2_area - inter_area + 1e-6
         iou = inter_area / union_area
 
-        # 3. Calculate the smallest enclosing box
+        # 2. Calculate Center Distance Squared (d^2)
+        d_sq = (box1[..., 0] - box2[..., 0])**2 + (box1[..., 1] - box2[..., 1])**2
+
+        # 3. Calculate Diagonal of the smallest enclosing box squared (c^2)
         c_x1 = torch.min(b1_x1, b2_x1)
         c_y1 = torch.min(b1_y1, b2_y1)
         c_x2 = torch.max(b1_x2, b2_x2)
         c_y2 = torch.max(b1_y2, b2_y2)
-        c_area = torch.clamp(c_x2 - c_x1, min=0) * torch.clamp(c_y2 - c_y1, min=0) + 1e-6
+        c_sq = (c_x2 - c_x1)**2 + (c_y2 - c_y1)**2 + 1e-6
 
-        # 4. Calculate GIoU
-        giou = iou - (c_area - union_area) / c_area
-        return iou, giou
+        # 4. Calculate Aspect Ratio Penalty (v)
+        w1, h1 = box1[..., 2], box1[..., 3]
+        w2, h2 = box2[..., 2], box2[..., 3]
+        
+        # v = (4 / pi^2) * (arctan(w_gt/h_gt) - arctan(w/h))^2
+        v = (4 / (math.pi ** 2)) * torch.pow(torch.atan(w2 / (h2 + 1e-6)) - torch.atan(w1 / (h1 + 1e-6)), 2)
+
+        # 5. Calculate Alpha
+        with torch.no_grad():
+            alpha = v / ((1.0 - iou) + v + 1e-6)
+
+        # 6. Calculate Final CIoU
+        ciou = iou - (d_sq / c_sq + alpha * v)
+        
+        return iou, ciou
 
     def forward(self, predictions, target):
         device = predictions.device
@@ -352,20 +392,20 @@ class YOLOLoss(nn.Module):
         pred_box1_global = self.decode_to_global(pred_box1, device)
         pred_box2_global = self.decode_to_global(pred_box2, device)
 
-        # 2. Find best box for each cell based on IoU
-        iou1, giou1 = self.compute_giou(pred_box1_global, target_boxes_global)
-        iou2, giou2 = self.compute_giou(pred_box2_global, target_boxes_global)
+        # 2. Find best box for each cell based on CIoU (thay vì GIoU)
+        iou1, ciou1 = self.compute_ciou(pred_box1_global, target_boxes_global)
+        iou2, ciou2 = self.compute_ciou(pred_box2_global, target_boxes_global)
         
         iou1 = iou1.unsqueeze(3)
         iou2 = iou2.unsqueeze(3)
-        giou1 = giou1.unsqueeze(3)
-        giou2 = giou2.unsqueeze(3)
+        ciou1 = ciou1.unsqueeze(3)
+        ciou2 = ciou2.unsqueeze(3)
 
-        # Mask better box (the one with higher IoU) for each cell
+        # Mask better box for each cell
         best_box = (iou1 > iou2).float()
 
         pred_best_conf = best_box * pred_conf1 + (1 - best_box) * pred_conf2
-        best_giou = best_box * giou1 + (1 - best_box) * giou2
+        best_ciou = best_box * ciou1 + (1 - best_box) * ciou2
         
         best_ious = torch.max(iou1, iou2)
         target_best_conf = target_obj * best_ious
@@ -378,8 +418,8 @@ class YOLOLoss(nn.Module):
         # 4. Calculate losses 
         # =================================================================
 
-        # A. COORDINATE LOSS
-        loss_coord = self.lambda_coord * torch.sum(obj_mask * (1.0 - best_giou))
+        # A. COORDINATE LOSS 
+        loss_coord = self.lambda_coord * torch.sum(obj_mask * (1.0 - best_ciou))
 
         # B. CONFIDENCE LOSS 
         loss_conf_obj = torch.sum(obj_mask * F.binary_cross_entropy(pred_best_conf, target_best_conf, reduction='none'))
@@ -397,7 +437,6 @@ class YOLOLoss(nn.Module):
 
         total_loss = loss_coord + loss_conf_obj + loss_conf_noobj + loss_class
         return total_loss / predictions.shape[0]
-
 
 
 def train_model(model, train_loader, val_loader, optimizer, criterion,
