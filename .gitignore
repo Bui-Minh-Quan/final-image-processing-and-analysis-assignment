@@ -8,3 +8,6 @@
 
 # model checkpoints
 models/*.pth
+
+# zip files
+*.zip

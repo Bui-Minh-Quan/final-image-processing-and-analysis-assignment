@@ -30,10 +30,10 @@ def download_weights(url, save_path):
 
 # Model definition
 class DecoupledHead(nn.Module):
-    def __init__(self, in_channels=512, hidden_channels=256, B=2, C=5):
+    def __init__(self, in_channels=2048, hidden_channels=256, B=2, C=5):
         super(DecoupledHead, self).__init__()
         
-        # 1. Stem 
+        # 1. Stem
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.BatchNorm2d(hidden_channels),
@@ -65,7 +65,6 @@ class DecoupledHead(nn.Module):
     def forward(self, x):
         x = self.stem(x)
         
-    
         reg_out = self.reg_branch(x) 
         cls_out = self.cls_branch(x) 
 
@@ -80,19 +79,18 @@ class YOLOv1ResNet(nn.Module):
         self.B = B 
         self.C = C 
 
-        # 1. Backbone (ResNet18)
-        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        # 1. Backbone 
+        resnet = models.resnet101(weights=None)
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])
 
-        # 2. Decoupled Head
-        self.yolo_head = DecoupledHead(in_channels=512, hidden_channels=256, B=self.B, C=self.C)
+        # 2. Decoupled Head 
+        self.yolo_head = DecoupledHead(in_channels=2048, hidden_channels=256, B=self.B, C=self.C)
 
     def forward(self, x):
         x = self.backbone(x)
         x = self.yolo_head(x)
         x = x.permute(0, 2, 3, 1) 
         return x
-
 
 # Utility functions for post-processing
 def compute_iou_1d(box1, box2):
@@ -118,9 +116,6 @@ def non_max_suppression(bboxes, iou_threshold=0.4, conf_threshold=0.05):
 
 
 def soft_nms(bboxes, iou_threshold=0.4, conf_threshold=0.05, sigma=0.5):
-    """
-    Thuật toán Soft-NMS sử dụng hàm Gaussian penalty.
-    """
     bboxes = [box for box in bboxes if box[4] > conf_threshold]
     bboxes_after_nms = []
 
@@ -143,6 +138,34 @@ def soft_nms(bboxes, iou_threshold=0.4, conf_threshold=0.05, sigma=0.5):
 
     return bboxes_after_nms
 
+def decode_yolo_predictions(predictions, S=14, B=2, C=5, image_size=448, conf_thresh=0.05):
+    bboxes = []
+    cell_size = image_size / S
+    for i in range(S):
+        for j in range(S):
+            class_probs = predictions[i, j, 10:15]
+            class_id = torch.argmax(class_probs).item()
+            class_score = torch.max(class_probs).item()
+            for b in range(B):
+                box_idx = b * 5
+                confidence = predictions[i, j, box_idx + 4].item() * class_score
+                if confidence < conf_thresh: continue
+                x_cell = predictions[i, j, box_idx + 0].item()
+                y_cell = predictions[i, j, box_idx + 1].item()
+                w_norm = predictions[i, j, box_idx + 2].item()
+                h_norm = predictions[i, j, box_idx + 3].item()
+                
+                x_center = (j + x_cell) * cell_size
+                y_center = (i + y_cell) * cell_size
+                w = w_norm * image_size
+                h = h_norm * image_size
+                
+                xmin = x_center - w / 2
+                ymin = y_center - h / 2
+                xmax = x_center + w / 2
+                ymax = y_center + h / 2
+                bboxes.append([xmin, ymin, xmax, ymax, confidence, class_id])
+    return bboxes
 
 def predict_with_tta(model, image, device, args):
     orig_h, orig_w = image.shape[:2]
@@ -180,34 +203,6 @@ def predict_with_tta(model, image, device, args):
 
     return final_boxes
 
-def decode_yolo_predictions(predictions, S=14, B=2, C=5, image_size=448, conf_thresh=0.05):
-    bboxes = []
-    cell_size = image_size / S
-    for i in range(S):
-        for j in range(S):
-            class_probs = predictions[i, j, 10:15]
-            class_id = torch.argmax(class_probs).item()
-            class_score = torch.max(class_probs).item()
-            for b in range(B):
-                box_idx = b * 5
-                confidence = predictions[i, j, box_idx + 4].item() * class_score
-                if confidence < conf_thresh: continue
-                x_cell = predictions[i, j, box_idx + 0].item()
-                y_cell = predictions[i, j, box_idx + 1].item()
-                w_norm = predictions[i, j, box_idx + 2].item()
-                h_norm = predictions[i, j, box_idx + 3].item()
-                
-                x_center = (j + x_cell) * cell_size
-                y_center = (i + y_cell) * cell_size
-                w = w_norm * image_size
-                h = h_norm * image_size
-                
-                xmin = x_center - w / 2
-                ymin = y_center - h / 2
-                xmax = x_center + w / 2
-                ymax = y_center + h / 2
-                bboxes.append([xmin, ymin, xmax, ymax, confidence, class_id])
-    return bboxes
 
 
 

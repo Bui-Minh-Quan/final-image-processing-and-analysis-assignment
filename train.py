@@ -232,10 +232,10 @@ class YOLODataset(Dataset):
 
 # Model definition
 class DecoupledHead(nn.Module):
-    def __init__(self, in_channels=512, hidden_channels=256, B=2, C=5):
+    def __init__(self, in_channels=2048, hidden_channels=256, B=2, C=5):
         super(DecoupledHead, self).__init__()
         
-        # 1. Stem 
+        # 1. Stem
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
             nn.BatchNorm2d(hidden_channels),
@@ -267,7 +267,6 @@ class DecoupledHead(nn.Module):
     def forward(self, x):
         x = self.stem(x)
         
-    
         reg_out = self.reg_branch(x) 
         cls_out = self.cls_branch(x) 
 
@@ -282,12 +281,12 @@ class YOLOv1ResNet(nn.Module):
         self.B = B 
         self.C = C 
 
-        # 1. Backbone (ResNet18)
-        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        # 1. Backbone 
+        resnet = models.resnet101(weights=None)
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])
 
-        # 2. Decoupled Head
-        self.yolo_head = DecoupledHead(in_channels=512, hidden_channels=256, B=self.B, C=self.C)
+        # 2. Decoupled Head 
+        self.yolo_head = DecoupledHead(in_channels=2048, hidden_channels=256, B=self.B, C=self.C)
 
     def forward(self, x):
         x = self.backbone(x)
@@ -504,6 +503,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion,
                 torch.save(model.state_dict(), save_path)
 
                 print(f"-> Saved best model at Epoch {epoch} (Val Loss: {best_val_loss:.4f})")
+
 
 
 def parse_args():
